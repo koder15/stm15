@@ -437,6 +437,7 @@ async fn run_loop(
     while !stop_flag.load(Ordering::SeqCst) {
         let mut child = match Command::new("ssh")
             .args(&args)
+            .kill_on_drop(true)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()

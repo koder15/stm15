@@ -304,7 +304,7 @@ impl FormScreen {
         self.active = (self.active + self.fields.len() - 1) % self.fields.len();
     }
 
-    fn to_config(&self) -> Option<TunnelConfig> {
+    fn to_config(&self) -> Result<TunnelConfig, String> {
         let get = |label: &str| -> String {
             self.fields
                 .iter()
@@ -312,22 +312,32 @@ impl FormScreen {
                 .map(|f| f.input.buffer.clone())
                 .unwrap_or_default()
         };
+        let parse_port = |label: &str, default: u16| -> Result<u16, String> {
+            let s = get(label);
+            if s.is_empty() {
+                return Ok(default);
+            }
+            s.parse::<u16>().map_err(|_| format!("{label}: must be 1–65535"))
+        };
 
         let name = get("Name");
         if name.is_empty() {
-            return None;
+            return Err("Name is required".into());
         }
+        let local_port = parse_port("Local Port", 0)?;
+        let ssh_port = parse_port("SSH Port", 22)?;
+        let remote_port = parse_port("Remote Port", 0)?;
 
-        Some(TunnelConfig {
+        Ok(TunnelConfig {
             name,
             tunnel_type: get("Type"),
-            local_port: get("Local Port").parse().unwrap_or(0),
+            local_port,
             ssh_host: get("SSH Host"),
-            ssh_port: get("SSH Port").parse().unwrap_or(22),
+            ssh_port,
             ssh_user: get("SSH User"),
             ssh_key: get("SSH Key"),
             remote_host: get("Remote Host"),
-            remote_port: get("Remote Port").parse().unwrap_or(0),
+            remote_port,
             enabled: get("Auto-start") == "true",
         })
     }
@@ -634,6 +644,17 @@ impl App {
         actions
     }
 
+    pub fn clamp_selection(&mut self) {
+        let n = self.tunnel_count();
+        if n == 0 {
+            self.table_state.select(None);
+        } else if let Some(sel) = self.table_state.selected() {
+            if sel >= n {
+                self.table_state.select(Some(n - 1));
+            }
+        }
+    }
+
     fn clear_notification(&mut self) {
         if let Some((_, ts)) = &self.notification {
             if ts.elapsed() > Duration::from_secs(5) {
@@ -649,6 +670,7 @@ impl App {
         if key.code == crossterm::event::KeyCode::Esc {
             if matches!(&self.mode, AppMode::Form(_) | AppMode::Confirm(_) | AppMode::Picker(_) | AppMode::Help) {
                 self.mode = AppMode::Normal;
+                self.editing_index = None;
                 return;
             }
         }
@@ -711,6 +733,11 @@ impl App {
                 AppMode::Normal
             }
             KeyCode::Char('?') => AppMode::Help,
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.pending_actions.push(Action::StartAll);
+                self.notify("Starting all enabled tunnels...");
+                AppMode::Normal
+            }
             KeyCode::Char('a') => AppMode::Form(FormScreen::new_add()),
             KeyCode::Char('i') => {
                 let picker = PickerScreen::from_ssh_config();
@@ -750,12 +777,7 @@ impl App {
                 self.notify("Running health check...");
                 AppMode::Normal
             }
-            KeyCode::Char('A') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.pending_actions.push(Action::StartAll);
-                self.notify("Starting all enabled tunnels...");
-                AppMode::Normal
-            }
-            KeyCode::Char('X') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.pending_actions.push(Action::StopAll);
                 self.notify("Stopping all tunnels...");
                 AppMode::Normal
@@ -769,16 +791,19 @@ impl App {
 
         match key.code {
             KeyCode::Enter => {
-                if let Some(config) = form.to_config() {
-                    if let Some(i) = self.editing_index.take() {
-                        self.pending_actions.push(Action::EditTunnel(i, config));
-                    } else {
-                        self.pending_actions.push(Action::AddTunnel(config));
+                match form.to_config() {
+                    Ok(config) => {
+                        if let Some(i) = self.editing_index.take() {
+                            self.pending_actions.push(Action::EditTunnel(i, config));
+                        } else {
+                            self.pending_actions.push(Action::AddTunnel(config));
+                        }
+                        return AppMode::Normal;
                     }
-                    return AppMode::Normal;
-                } else {
-                    self.notify("Name is required");
-                    AppMode::Form(form.clone())
+                    Err(msg) => {
+                        self.notify(&msg);
+                        AppMode::Form(form.clone())
+                    }
                 }
             }
             KeyCode::Tab | KeyCode::Down => {
@@ -1089,16 +1114,18 @@ pub async fn execute_action(action: Action, manager: Arc<Mutex<TunnelManager>>, 
         Action::AddTunnel(config) => {
             let name = config.name.clone();
             let enabled = config.enabled;
-            {
-                let mut mgr = manager.lock().unwrap();
-                mgr.add_tunnel(config);
-                let idx = mgr.tunnels.len() - 1;
-                if enabled {
-                    mgr.start(idx);
-                }
-                drop(mgr);
+            let mut mgr = manager.lock().unwrap();
+            mgr.add_tunnel(config);
+            let idx = mgr.tunnels.len() - 1;
+            let save_result = mgr.save_config();
+            if enabled {
+                mgr.start(idx);
             }
-            app.notify(&format!("Added: {name}"));
+            drop(mgr);
+            match save_result {
+                Err(e) => app.notify(&format!("Save failed: {e}")),
+                Ok(()) => app.notify(&format!("Added: {name}")),
+            }
         }
         Action::EditTunnel(i, config) => {
             let name = config.name.clone();
@@ -1113,21 +1140,31 @@ pub async fn execute_action(action: Action, manager: Arc<Mutex<TunnelManager>>, 
                 if let Some(t) = mgr.tunnels.get_mut(i) {
                     t.config = config;
                 }
-                mgr.save_config();
+                let save_result = mgr.save_config();
                 if enabled {
                     mgr.start(i);
                 }
                 drop(mgr);
+                match save_result {
+                    Err(e) => app.notify(&format!("Save failed: {e}")),
+                    Ok(()) => app.notify(&format!("Updated: {name}")),
+                }
             }
-            app.notify(&format!("Updated: {name}"));
         }
         Action::DeleteTunnel(i) => {
             let mut mgr = manager.lock().unwrap();
+            mgr.stop(i);
             let t = mgr.remove_tunnel(i);
-            mgr.save_config();
+            let save_result = mgr.save_config();
             drop(mgr);
-            if let Some(t) = t {
-                app.notify(&format!("Deleted: {}", t.config.name));
+            app.clamp_selection();
+            match save_result {
+                Err(e) => app.notify(&format!("Save failed: {e}")),
+                Ok(()) => {
+                    if let Some(t) = t {
+                        app.notify(&format!("Deleted: {}", t.config.name));
+                    }
+                }
             }
         }
         Action::StartAll => {

@@ -70,6 +70,7 @@ pub fn parse_ssh_config() -> Vec<SshHost> {
     let mut current_port: u16 = 22;
     let mut current_user: Option<String> = None;
     let mut current_idfile: Option<String> = None;
+    let mut in_match_block = false;
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -82,7 +83,8 @@ pub fn parse_ssh_config() -> Vec<SshHost> {
             None => continue,
         };
 
-        if key == "host" {
+        if key == "host" || key == "match" {
+            // Flush the current Host entry before starting a new block.
             if !current_names.is_empty() {
                 let hostname = current_hostname
                     .clone()
@@ -100,12 +102,19 @@ pub fn parse_ssh_config() -> Vec<SshHost> {
                     });
                 }
             }
-            current_names = value.split_whitespace().map(|s| s.to_string()).collect();
             current_hostname = None;
             current_port = 22;
             current_user = None;
             current_idfile = None;
-        } else {
+            if key == "host" {
+                current_names = value.split_whitespace().map(|s| s.to_string()).collect();
+                in_match_block = false;
+            } else {
+                // Match blocks have conditional directives; skip their contents.
+                current_names = Vec::new();
+                in_match_block = true;
+            }
+        } else if !in_match_block {
             match key.as_str() {
                 "hostname" => current_hostname = Some(value.to_string()),
                 "port" => current_port = value.parse().unwrap_or(22),
@@ -289,19 +298,18 @@ impl TunnelManager {
         }
     }
 
-    pub fn save_config(&self) {
+    pub fn save_config(&self) -> anyhow::Result<()> {
         if let Some(parent) = self.config_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
         }
         let tunnels: Vec<TunnelConfig> = self.tunnels.iter().map(|t| t.config.clone()).collect();
-        if let Ok(yaml) = serde_yaml::to_string(&ConfigFile { tunnels }) {
-            let _ = std::fs::write(&self.config_path, yaml);
-        }
+        let yaml = serde_yaml::to_string(&ConfigFile { tunnels })?;
+        std::fs::write(&self.config_path, yaml)?;
+        Ok(())
     }
 
     pub fn add_tunnel(&mut self, config: TunnelConfig) {
         self.tunnels.push(Tunnel::from_config(config));
-        self.save_config();
     }
 
     pub fn remove_tunnel(&mut self, index: usize) -> Option<Tunnel> {
@@ -369,7 +377,6 @@ impl TunnelManager {
 // ── process helpers ─────────────────────────────────────────────────────────
 
 fn start_tunnel(t: &Tunnel) {
-    // Abort any existing task
     {
         let mut task_lock = t.task.lock().unwrap();
         t.stop_flag.store(true, Ordering::SeqCst);
@@ -378,8 +385,6 @@ fn start_tunnel(t: &Tunnel) {
         }
         *task_lock = None;
     }
-
-    std::thread::sleep(Duration::from_millis(300));
 
     t.stop_flag.store(false, Ordering::SeqCst);
 
@@ -396,6 +401,12 @@ fn start_tunnel(t: &Tunnel) {
     let stop_flag = t.stop_flag.clone();
 
     let handle = tokio::spawn(async move {
+        // Async delay so the previous SSH process has time to release the port.
+        // Does not block the UI thread or the manager lock.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if stop_flag.load(Ordering::SeqCst) {
+            return;
+        }
         run_loop(args, stop_flag, state).await;
     });
 
@@ -534,31 +545,36 @@ async fn sleep_if_not_stopped(stop_flag: &Arc<AtomicBool>, secs: u64) {
 pub async fn health_check_loop(manager: Arc<Mutex<TunnelManager>>) {
     loop {
         tokio::time::sleep(Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS)).await;
-        let checks: Vec<(u16, Arc<AtomicBool>)> = {
+        let checks: Vec<(usize, u16)> = {
             let mgr = manager.lock().unwrap();
             mgr.tunnels
                 .iter()
-                .filter_map(|t| {
+                .enumerate()
+                .filter_map(|(idx, t)| {
                     let s = t.state.lock().unwrap();
                     if s.status == TunnelStatus::Running {
                         let port = *t.health_port.lock().unwrap();
-                        if port > 0 {
-                            Some((port, t.stop_flag.clone()))
-                        } else {
-                            None
-                        }
+                        if port > 0 { Some((idx, port)) } else { None }
                     } else {
                         None
                     }
                 })
                 .collect()
         };
-        for (port, stop_flag) in &checks {
-            let healthy = check_port(*port).await;
+        for (idx, port) in checks {
+            let healthy = check_port(port).await;
             if !healthy {
-                stop_flag.store(true, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                stop_flag.store(false, Ordering::SeqCst);
+                let mgr = manager.lock().unwrap();
+                // Re-check status: user may have manually stopped the tunnel
+                // between when we collected the check list and now.
+                if let Some(t) = mgr.tunnels.get(idx) {
+                    let still_running = t.state.lock()
+                        .map(|s| s.status == TunnelStatus::Running)
+                        .unwrap_or(false);
+                    if still_running {
+                        mgr.start(idx);
+                    }
+                }
             }
         }
     }

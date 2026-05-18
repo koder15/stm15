@@ -26,6 +26,7 @@ pub enum Action {
 
 // ── input field ─────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct InputField {
     label: String,
     buffer: String,
@@ -147,12 +148,14 @@ enum FieldType {
     Select { options: Vec<String>, index: usize },
 }
 
+#[derive(Clone)]
 struct FormField {
     label: String,
     input: InputField,
     field_type: FieldType,
 }
 
+#[derive(Clone)]
 struct FormScreen {
     title: String,
     fields: Vec<FormField>,
@@ -373,6 +376,7 @@ impl FormScreen {
 
 // ── picker (host selector) ──────────────────────────────────────────
 
+#[derive(Clone)]
 struct PickerScreen {
     items: Vec<(String, crate::tunnel::SshHost)>,
     selected: usize,
@@ -651,37 +655,23 @@ impl App {
 
         let old_mode = std::mem::replace(&mut self.mode, AppMode::Normal);
         let new_mode = match old_mode {
-            AppMode::Form(mut form) => {
-                self.handle_form(key, &mut form);
-                AppMode::Form(form)
-            }
-            AppMode::Confirm(confirm) => {
-                self.handle_confirm(key);
-                AppMode::Confirm(confirm)
-            }
-            AppMode::Picker(mut picker) => {
-                self.handle_picker(key, &mut picker);
-                AppMode::Picker(picker)
-            }
-            AppMode::Help => {
-                self.mode = AppMode::Normal;
-                AppMode::Normal
-            }
-            AppMode::Normal => {
-                self.handle_normal(key);
-                AppMode::Normal
-            }
+            AppMode::Form(mut form) => self.handle_form(key, &mut form),
+            AppMode::Confirm(confirm) => self.handle_confirm(key, confirm),
+            AppMode::Picker(mut picker) => self.handle_picker(key, &mut picker),
+            AppMode::Help => AppMode::Normal,
+            AppMode::Normal => self.handle_normal(key),
         };
         self.mode = new_mode;
     }
 
-    fn handle_normal(&mut self, key: crossterm::event::KeyEvent) {
+    fn handle_normal(&mut self, key: crossterm::event::KeyEvent) -> AppMode {
         use crossterm::event::{KeyCode, KeyModifiers};
         let n = self.tunnel_count();
 
         match key.code {
             KeyCode::Char('q') => {
                 self.pending_actions.push(Action::Quit);
+                AppMode::Normal
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if n > 0 {
@@ -689,6 +679,7 @@ impl App {
                     let next = if i + 1 < n { i + 1 } else { 0 };
                     self.table_state.select(Some(next));
                 }
+                AppMode::Normal
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if n > 0 {
@@ -696,37 +687,38 @@ impl App {
                     let prev = if i > 0 { i - 1 } else { n - 1 };
                     self.table_state.select(Some(prev));
                 }
+                AppMode::Normal
             }
             KeyCode::Char('s') => {
                 if let Some(i) = self.selected() {
                     self.pending_actions.push(Action::Start(i));
                     self.notify("Starting tunnel...");
                 }
+                AppMode::Normal
             }
             KeyCode::Char('K') => {
                 if let Some(i) = self.selected() {
                     self.pending_actions.push(Action::Stop(i));
                     self.notify("Stopping tunnel...");
                 }
+                AppMode::Normal
             }
             KeyCode::Char('r') => {
                 if let Some(i) = self.selected() {
                     self.pending_actions.push(Action::Restart(i));
                     self.notify("Restarting tunnel...");
                 }
+                AppMode::Normal
             }
-            KeyCode::Char('?') => {
-                self.mode = AppMode::Help;
-            }
-            KeyCode::Char('a') => {
-                self.mode = AppMode::Form(FormScreen::new_add());
-            }
+            KeyCode::Char('?') => AppMode::Help,
+            KeyCode::Char('a') => AppMode::Form(FormScreen::new_add()),
             KeyCode::Char('i') => {
                 let picker = PickerScreen::from_ssh_config();
                 if picker.items.is_empty() {
                     self.notify("No hosts in ~/.ssh/config");
+                    AppMode::Normal
                 } else {
-                    self.mode = AppMode::Picker(picker);
+                    AppMode::Picker(picker)
                 }
             }
             KeyCode::Char('e') => {
@@ -734,41 +726,45 @@ impl App {
                     if let Ok(mgr) = self.manager.lock() {
                         if let Some(t) = mgr.tunnels.get(i) {
                             self.editing_index = Some(i);
-                            let form = FormScreen::new_edit(&t.config);
-                            self.mode = AppMode::Form(form);
+                            return AppMode::Form(FormScreen::new_edit(&t.config));
                         }
                     }
                 }
+                AppMode::Normal
             }
             KeyCode::Char('d') => {
                 if let Some(i) = self.selected() {
                     if let Ok(mgr) = self.manager.lock() {
                         if let Some(t) = mgr.tunnels.get(i) {
-                            self.mode = AppMode::Confirm(ConfirmScreen::new(&format!(
+                            return AppMode::Confirm(ConfirmScreen::new(&format!(
                                 "Delete tunnel '{}'?",
                                 t.config.name
                             )));
                         }
                     }
                 }
+                AppMode::Normal
             }
             KeyCode::Char('h') => {
                 self.pending_actions.push(Action::HealthCheck);
                 self.notify("Running health check...");
+                AppMode::Normal
             }
             KeyCode::Char('A') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.pending_actions.push(Action::StartAll);
                 self.notify("Starting all enabled tunnels...");
+                AppMode::Normal
             }
             KeyCode::Char('X') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.pending_actions.push(Action::StopAll);
                 self.notify("Stopping all tunnels...");
+                AppMode::Normal
             }
-            _ => {}
+            _ => AppMode::Normal,
         }
     }
 
-    fn handle_form(&mut self, key: crossterm::event::KeyEvent, form: &mut FormScreen) {
+    fn handle_form(&mut self, key: crossterm::event::KeyEvent, form: &mut FormScreen) -> AppMode {
         use crossterm::event::KeyCode;
 
         match key.code {
@@ -779,46 +775,57 @@ impl App {
                     } else {
                         self.pending_actions.push(Action::AddTunnel(config));
                     }
-                    self.mode = AppMode::Normal;
+                    return AppMode::Normal;
                 } else {
                     self.notify("Name is required");
+                    AppMode::Form(form.clone())
                 }
             }
             KeyCode::Tab | KeyCode::Down => {
                 form.next_field();
+                AppMode::Form(form.clone())
             }
             KeyCode::BackTab | KeyCode::Up => {
                 form.prev_field();
+                AppMode::Form(form.clone())
             }
             KeyCode::Char(' ') => {
                 form.cycle_select(true);
+                AppMode::Form(form.clone())
             }
             KeyCode::Backspace => {
                 form.fields[form.active].input.backspace();
+                AppMode::Form(form.clone())
             }
             KeyCode::Delete => {
                 form.fields[form.active].input.delete();
+                AppMode::Form(form.clone())
             }
             KeyCode::Left => {
                 form.fields[form.active].input.cursor_left();
+                AppMode::Form(form.clone())
             }
             KeyCode::Right => {
                 form.fields[form.active].input.cursor_right();
+                AppMode::Form(form.clone())
             }
             KeyCode::Home => {
                 form.fields[form.active].input.home();
+                AppMode::Form(form.clone())
             }
             KeyCode::End => {
                 form.fields[form.active].input.end();
+                AppMode::Form(form.clone())
             }
             KeyCode::Char(c) => {
                 form.handle_key(c);
+                AppMode::Form(form.clone())
             }
-            _ => {}
+            _ => AppMode::Form(form.clone()),
         }
     }
 
-    fn handle_confirm(&mut self, key: crossterm::event::KeyEvent) {
+    fn handle_confirm(&mut self, key: crossterm::event::KeyEvent, _confirm: ConfirmScreen) -> AppMode {
         use crossterm::event::KeyCode;
 
         match key.code {
@@ -826,16 +833,14 @@ impl App {
                 if let Some(i) = self.selected() {
                     self.pending_actions.push(Action::DeleteTunnel(i));
                 }
-                self.mode = AppMode::Normal;
+                AppMode::Normal
             }
-            KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.mode = AppMode::Normal;
-            }
-            _ => {}
+            KeyCode::Char('n') | KeyCode::Char('N') => AppMode::Normal,
+            _ => AppMode::Confirm(_confirm),
         }
     }
 
-    fn handle_picker(&mut self, key: crossterm::event::KeyEvent, picker: &mut PickerScreen) {
+    fn handle_picker(&mut self, key: crossterm::event::KeyEvent, picker: &mut PickerScreen) -> AppMode {
         use crossterm::event::KeyCode;
 
         match key.code {
@@ -853,12 +858,19 @@ impl App {
                         remote_port: 0,
                         enabled: true,
                     };
-                    self.mode = AppMode::Form(FormScreen::new_edit(&config));
+                    return AppMode::Form(FormScreen::new_edit(&config));
                 }
+                AppMode::Picker(picker.clone())
             }
-            KeyCode::Char('j') | KeyCode::Down => picker.down(),
-            KeyCode::Char('k') | KeyCode::Up => picker.up(),
-            _ => {}
+            KeyCode::Char('j') | KeyCode::Down => {
+                picker.down();
+                AppMode::Picker(picker.clone())
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                picker.up();
+                AppMode::Picker(picker.clone())
+            }
+            _ => AppMode::Picker(picker.clone()),
         }
     }
 

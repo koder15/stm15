@@ -16,25 +16,24 @@ use tunnel::TunnelManager;
 fn main() -> anyhow::Result<()> {
     let config_path = std::env::args().nth(1).map(std::path::PathBuf::from);
 
-    let mgr = TunnelManager::new(config_path);
-    let manager = Arc::new(Mutex::new(mgr));
-
-    // Start enabled tunnels
-    {
-        let m = manager.lock().unwrap();
-        m.start_all_enabled();
-    }
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
 
-    // Spawn health check loop
+    let _guard = rt.enter();
+
+    let mgr = TunnelManager::new(config_path);
+    let manager = Arc::new(Mutex::new(mgr));
+
+    // Start enabled tunnels (now inside runtime context)
     {
-        let mgr = manager.clone();
-        rt.spawn(tunnel::health_check_loop(mgr));
+        let m = manager.lock().unwrap();
+        m.start_all_enabled();
     }
+
+    // Spawn health check loop
+    rt.spawn(tunnel::health_check_loop(manager.clone()));
 
     // Terminal setup
     enable_raw_mode()?;
@@ -56,6 +55,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    drop(_guard);
     result
 }
 
@@ -87,9 +87,6 @@ fn run_tui(
                     }
                     app.handle_key(key);
                 }
-            }
-            if let Event::Resize(_, _) = event::read().unwrap_or(Event::Resize(0, 0)) {
-                // resize is handled on next draw
             }
         }
 

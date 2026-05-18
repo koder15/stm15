@@ -507,6 +507,72 @@ impl ConfirmScreen {
     }
 }
 
+// ── help screen ─────────────────────────────────────────────────────
+
+struct HelpScreen;
+
+impl HelpScreen {
+    fn render(&self, area: Rect, f: &mut Frame) {
+        let lines = vec![
+            ("j / ↓", "Move down"),
+            ("k / ↑", "Move up"),
+            ("s", "Start selected tunnel"),
+            ("K", "Stop selected tunnel"),
+            ("r", "Restart selected tunnel"),
+            ("a", "Add tunnel (blank form)"),
+            ("i", "Import from ~/.ssh/config"),
+            ("e", "Edit selected tunnel"),
+            ("d", "Delete selected tunnel"),
+            ("h", "Health check all running"),
+            ("Ctrl+A", "Start all enabled"),
+            ("Ctrl+X", "Stop all"),
+            ("?", "This help"),
+            ("Esc", "Cancel / go back"),
+            ("q", "Quit"),
+        ];
+
+        let h = lines.len() as u16 + 4;
+        let w: u16 = 40;
+        let popup = centered_rect(area, w, h);
+        f.render_widget(Clear, popup);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Help ")
+            .title_alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(popup);
+
+        let text: Vec<Line> = lines
+            .iter()
+            .map(|(key, desc)| {
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {:>7} ", key),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        desc.to_string(),
+                        Style::default().fg(Color::White),
+                    ),
+                ])
+            })
+            .collect();
+
+        f.render_widget(Paragraph::new(ratatui::text::Text::from(text)), inner);
+        f.render_widget(block, popup);
+
+        let dismiss = Span::styled(
+            " Press any key to close ",
+            Style::default().fg(Color::DarkGray),
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(dismiss)).alignment(Alignment::Center),
+            Rect::new(popup.x + 1, popup.y + popup.height - 1, popup.width.saturating_sub(2), 1),
+        );
+    }
+}
+
 // ── app ─────────────────────────────────────────────────────────────
 
 enum AppMode {
@@ -514,6 +580,7 @@ enum AppMode {
     Form(FormScreen),
     Confirm(ConfirmScreen),
     Picker(PickerScreen),
+    Help,
 }
 
 pub struct App {
@@ -576,7 +643,7 @@ impl App {
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         // Esc always cancels modals
         if key.code == crossterm::event::KeyCode::Esc {
-            if matches!(&self.mode, AppMode::Form(_) | AppMode::Confirm(_) | AppMode::Picker(_)) {
+            if matches!(&self.mode, AppMode::Form(_) | AppMode::Confirm(_) | AppMode::Picker(_) | AppMode::Help) {
                 self.mode = AppMode::Normal;
                 return;
             }
@@ -595,6 +662,10 @@ impl App {
             AppMode::Picker(mut picker) => {
                 self.handle_picker(key, &mut picker);
                 AppMode::Picker(picker)
+            }
+            AppMode::Help => {
+                self.mode = AppMode::Normal;
+                AppMode::Normal
             }
             AppMode::Normal => {
                 self.handle_normal(key);
@@ -643,6 +714,9 @@ impl App {
                     self.pending_actions.push(Action::Restart(i));
                     self.notify("Restarting tunnel...");
                 }
+            }
+            KeyCode::Char('?') => {
+                self.mode = AppMode::Help;
             }
             KeyCode::Char('a') => {
                 self.mode = AppMode::Form(FormScreen::new_add());
@@ -811,6 +885,7 @@ impl App {
             AppMode::Form(form) => form.render(area, f),
             AppMode::Confirm(confirm) => confirm.render(area, f),
             AppMode::Picker(picker) => picker.render(area, f),
+            AppMode::Help => HelpScreen.render(area, f),
             _ => {}
         }
     }

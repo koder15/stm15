@@ -1,0 +1,22 @@
+tunnels:
+  - name: "Example MySQL Tunnel"
+    type: local
+    local_port: 3307
+    ssh_host: "db.example.com"
+    ssh_port: 22
+    ssh_user: "deploy"
+    ssh_key: "~/.ssh/id_rsa"
+    remote_host: "localhost"
+    remote_port: 3306
+    enabled: true
+
+  - name: "Example SOCKS Proxy"
+    type: dynamic
+    local_port: 1080
+    ssh_host: "proxy.example.com"
+    ssh_port: 22
+    ssh_user: "user"
+    ssh_key: "~/.ssh/id_rsa"
+    remote_host: ""
+    remote_port: 0
+    enabled: false

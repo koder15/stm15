@@ -462,18 +462,46 @@ async fn run_loop(
             String::from_utf8_lossy(&buf).into_owned()
         });
 
-        let exit = child.wait().await;
-        let err_text = stderr_handle.await.unwrap_or_default();
+        // Poll child status so we can check stop_flag while running
+        let exit_status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {
+                    if stop_flag.load(Ordering::SeqCst) {
+                        let _ = child.kill().await;
+                        stderr_handle.abort();
+                        break None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(_) => {
+                    stderr_handle.abort();
+                    break None;
+                }
+            }
+        };
+
+        // Drain stderr if we didn't abort it
+        let err_text = if !stderr_handle.is_finished() {
+            stderr_handle.await.unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         if stop_flag.load(Ordering::SeqCst) {
             break;
         }
 
         failures += 1;
-        let msg = if !err_text.trim().is_empty() {
-            err_text.trim().lines().last().unwrap_or("").to_string()
-        } else {
-            format!("exit: {exit:?}")
+        let msg = match exit_status {
+            Some(status) => {
+                if !err_text.trim().is_empty() {
+                    err_text.trim().lines().last().unwrap_or("").to_string()
+                } else {
+                    format!("exit: {status:?}")
+                }
+            }
+            None => "killed".to_string(),
         };
 
         {

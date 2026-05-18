@@ -41,6 +41,102 @@ fn default_ssh_port() -> u16 { 22 }
 fn default_localhost() -> String { "localhost".into() }
 fn default_true() -> bool { true }
 
+// ── SSH config parsing ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct SshHost {
+    pub name: String,
+    pub hostname: Option<String>,
+    pub port: u16,
+    pub user: Option<String>,
+    pub identity_file: Option<String>,
+}
+
+pub fn parse_ssh_config() -> Vec<SshHost> {
+    let path = dirs::home_dir()
+        .map(|h| h.join(".ssh/config"))
+        .unwrap_or_default();
+    if !path.exists() {
+        return Vec::new();
+    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut hosts = Vec::new();
+    let mut current_names: Vec<String> = Vec::new();
+    let mut current_hostname: Option<String> = None;
+    let mut current_port: u16 = 22;
+    let mut current_user: Option<String> = None;
+    let mut current_idfile: Option<String> = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let (key, value) = match trimmed.split_once(|c: char| c.is_whitespace()) {
+            Some((k, v)) => (k.to_lowercase(), v.trim()),
+            None => continue,
+        };
+
+        if key == "host" {
+            if !current_names.is_empty() {
+                let hostname = current_hostname
+                    .clone()
+                    .unwrap_or_else(|| current_names[0].clone());
+                for name in current_names.drain(..) {
+                    if name == "*" {
+                        continue;
+                    }
+                    hosts.push(SshHost {
+                        name,
+                        hostname: Some(hostname.clone()),
+                        port: current_port,
+                        user: current_user.clone(),
+                        identity_file: current_idfile.clone(),
+                    });
+                }
+            }
+            current_names = value.split_whitespace().map(|s| s.to_string()).collect();
+            current_hostname = None;
+            current_port = 22;
+            current_user = None;
+            current_idfile = None;
+        } else {
+            match key.as_str() {
+                "hostname" => current_hostname = Some(value.to_string()),
+                "port" => current_port = value.parse().unwrap_or(22),
+                "user" => current_user = Some(value.to_string()),
+                "identityfile" => current_idfile = Some(value.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    if !current_names.is_empty() {
+        let hostname = current_hostname
+            .clone()
+            .unwrap_or_else(|| current_names[0].clone());
+        for name in current_names.drain(..) {
+            if name == "*" {
+                continue;
+            }
+            hosts.push(SshHost {
+                name,
+                hostname: Some(hostname.clone()),
+                port: current_port,
+                user: current_user.clone(),
+                identity_file: current_idfile.clone(),
+            });
+        }
+    }
+
+    hosts
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TunnelStatus {
     Stopped,

@@ -371,6 +371,97 @@ impl FormScreen {
     }
 }
 
+// ── picker (host selector) ──────────────────────────────────────────
+
+struct PickerScreen {
+    items: Vec<(String, crate::tunnel::SshHost)>,
+    selected: usize,
+}
+
+impl PickerScreen {
+    fn from_ssh_config() -> Self {
+        let hosts = crate::tunnel::parse_ssh_config();
+        let items: Vec<_> = hosts.into_iter().map(|h| {
+            let desc = if let Some(ref hostname) = h.hostname {
+                if let Some(ref user) = h.user {
+                    format!("{}  →  {}@{}:{}", h.name, user, hostname, h.port)
+                } else {
+                    format!("{}  →  {}:{}", h.name, hostname, h.port)
+                }
+            } else {
+                h.name.clone()
+            };
+            (desc, h)
+        }).collect();
+        PickerScreen { items, selected: 0 }
+    }
+
+    fn selected_host(&self) -> Option<&crate::tunnel::SshHost> {
+        self.items.get(self.selected).map(|(_, h)| h)
+    }
+
+    fn up(&mut self) {
+        if !self.items.is_empty() {
+            self.selected = (self.selected + self.items.len() - 1) % self.items.len();
+        }
+    }
+
+    fn down(&mut self) {
+        if !self.items.is_empty() {
+            self.selected = (self.selected + 1) % self.items.len();
+        }
+    }
+
+    fn render(&self, area: Rect, f: &mut Frame) {
+        let h = (self.items.len() as u16).min(area.height.saturating_sub(4)) + 4;
+        let popup = centered_rect(area, 60.min(area.width), h);
+        f.render_widget(Clear, popup);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Import from SSH config ")
+            .title_alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(popup);
+
+        let lines: Vec<Line> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, (desc, _))| {
+                let style = if i == self.selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                Line::from(Span::styled(format!(" {} ", desc), style))
+            })
+            .collect();
+
+        if lines.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    " No hosts found in ~/.ssh/config ",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                inner,
+            );
+        } else {
+            f.render_widget(Paragraph::new(ratatui::text::Text::from(lines)), inner);
+        }
+        f.render_widget(block, popup);
+
+        let help = Span::styled(
+            " j/k: navigate  |  Enter: select  |  Esc: cancel ",
+            Style::default().fg(Color::DarkGray),
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(help)).alignment(Alignment::Center),
+            Rect::new(popup.x + 1, popup.y + popup.height - 1, popup.width.saturating_sub(2), 1),
+        );
+    }
+}
+
 // ── confirm screen ──────────────────────────────────────────────────
 
 pub struct ConfirmScreen {
@@ -422,6 +513,7 @@ enum AppMode {
     Normal,
     Form(FormScreen),
     Confirm(ConfirmScreen),
+    Picker(PickerScreen),
 }
 
 pub struct App {
@@ -484,7 +576,7 @@ impl App {
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         // Esc always cancels modals
         if key.code == crossterm::event::KeyCode::Esc {
-            if matches!(&self.mode, AppMode::Form(_) | AppMode::Confirm(_)) {
+            if matches!(&self.mode, AppMode::Form(_) | AppMode::Confirm(_) | AppMode::Picker(_)) {
                 self.mode = AppMode::Normal;
                 return;
             }
@@ -499,6 +591,10 @@ impl App {
             AppMode::Confirm(confirm) => {
                 self.handle_confirm(key);
                 AppMode::Confirm(confirm)
+            }
+            AppMode::Picker(mut picker) => {
+                self.handle_picker(key, &mut picker);
+                AppMode::Picker(picker)
             }
             AppMode::Normal => {
                 self.handle_normal(key);
@@ -550,6 +646,14 @@ impl App {
             }
             KeyCode::Char('a') => {
                 self.mode = AppMode::Form(FormScreen::new_add());
+            }
+            KeyCode::Char('i') => {
+                let picker = PickerScreen::from_ssh_config();
+                if picker.items.is_empty() {
+                    self.notify("No hosts in ~/.ssh/config");
+                } else {
+                    self.mode = AppMode::Picker(picker);
+                }
             }
             KeyCode::Char('e') => {
                 if let Some(i) = self.selected() {
@@ -657,6 +761,33 @@ impl App {
         }
     }
 
+    fn handle_picker(&mut self, key: crossterm::event::KeyEvent, picker: &mut PickerScreen) {
+        use crossterm::event::KeyCode;
+
+        match key.code {
+            KeyCode::Enter => {
+                if let Some(host) = picker.selected_host() {
+                    let config = TunnelConfig {
+                        name: host.name.clone(),
+                        tunnel_type: "local".into(),
+                        local_port: 0,
+                        ssh_host: host.hostname.clone().unwrap_or_default(),
+                        ssh_port: host.port,
+                        ssh_user: host.user.clone().unwrap_or_default(),
+                        ssh_key: host.identity_file.clone().unwrap_or_default(),
+                        remote_host: "localhost".into(),
+                        remote_port: 0,
+                        enabled: true,
+                    };
+                    self.mode = AppMode::Form(FormScreen::new_edit(&config));
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => picker.down(),
+            KeyCode::Char('k') | KeyCode::Up => picker.up(),
+            _ => {}
+        }
+    }
+
     // ── rendering ───────────────────────────────────────────────────
 
     pub fn render(&mut self, f: &mut Frame) {
@@ -679,6 +810,7 @@ impl App {
         match &self.mode {
             AppMode::Form(form) => form.render(area, f),
             AppMode::Confirm(confirm) => confirm.render(area, f),
+            AppMode::Picker(picker) => picker.render(area, f),
             _ => {}
         }
     }
